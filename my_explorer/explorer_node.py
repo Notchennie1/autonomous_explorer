@@ -4,15 +4,12 @@ from nav_msgs.msg import OccupancyGrid, Odometry
 from geometry_msgs.msg import PoseStamped
 import math
 from collections import deque
+from geometry_msgs.msg import Twist
 
-
-#To shift goals away according to launcher offset
-LAUNCHER_OFFSET_Y   = 0.3
 #To commit to goals for longer
-SWITCH_THRESHOLD  = 2.0
+SWITCH_THRESHOLD  = 3.0
 #Prevent oscillation aaround same goal
-
-BLACKLIST_RADIUS = 0.6
+BLACKLIST_RADIUS = 0.2
 
 class SimpleExplorer(Node):
     def __init__(self):
@@ -21,6 +18,7 @@ class SimpleExplorer(Node):
         self.map_sub = self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
         self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
         self.goal_pub = self.create_publisher(PoseStamped, '/goal_pose', 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
         self.map_msg = None
         self.pos = (0.0, 0.0)
@@ -34,31 +32,76 @@ class SimpleExplorer(Node):
     
     def map_callback(self,msg):
         self.map_msg = msg
+        self.res = self.map_msg.info.resolution
+        self.origin_x = self.map_msg.info.origin.position.x
+        self.origin_y = self.map_msg.info.origin.position.y
+        self.w = self.map_msg.info.width
     
     def odom_callback(self,msg):
         self.pos = (msg.pose.pose.position.x, msg.pose.pose.position.y)
     
     def get_world_coords(self, index):
-        res = self.map_msg.info.resolution
-        origin = self.map_msg.info.origin.position
-        w = self.map_msg.info.width
-        return (origin.x + (index % w) * res, origin.y + (index // w) * res)
+        return (self.origin_x + (index % self.w) * self.res, 
+        self.origin_y + (index // self.w) * self.res)
     
+    def cluster_frontiers(self, frontiers_coords):
+        CLUSTER_RADIUS = 0.6
+        bucket_size = CLUSTER_RADIUS
+
+        buckets = {}
+        for point in frontiers_coords:
+            key = (int(point[0] / bucket_size), int(point[1] / bucket_size))
+            buckets.setdefault(key, []).append(point)
+
+        visited = set()
+        clusters = []
+
+        for start in frontiers_coords:
+            if start in visited:
+                continue
+
+            cluster = []
+            queue = deque([start])
+            visited.add(start)
+
+            while queue:
+                point = queue.popleft()
+                cluster.append(point)
+
+                bx = int(point[0] / bucket_size)
+                by = int(point[1] / bucket_size)
+
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        for neighbour in buckets.get((bx + dx, by + dy), []):
+                            if neighbour not in visited and math.dist(point, neighbour) < CLUSTER_RADIUS:
+                                visited.add(neighbour)
+                                queue.append(neighbour)
+
+            clusters.append(cluster)
+
+        return clusters
+
+
     def explore(self):
         if not self.map_msg: 
             return
 
         if self.current_goal is not None:
             moved = math.dist(self.pos, self.last_pos)
-            if moved < 0.05:
+            if moved < 0.01:
                 self.stuck_counter += 1
             else:
                 self.stuck_counter = 0
         self.last_pos = self.pos
 
         if self.stuck_counter >= 5:
+            self.get_logger().error("STUCK")
             if self.current_goal:
                 self.blacklist.append(self.current_goal)
+                if len(self.blacklist) > 20:
+                     self.blacklist.pop(0)
+
             self.current_goal  = None
             self.current_score = 0.0
             self.stuck_counter = 0
@@ -76,6 +119,7 @@ class SimpleExplorer(Node):
         grid = self.map_msg.data
         w, h = self.map_msg.info.width, self.map_msg.info.height
         frontiers_coords = []
+
 
         for y in range(1, h - 1):
             for x in range(1, w - 1):
@@ -97,39 +141,8 @@ class SimpleExplorer(Node):
         if not frontiers_coords:
             self.get_logger().info("Exploration Complete!")
             return
-        
-        visited = set()
-        clusters = []
-        
-        for start in frontiers_coords:
-            if start in visited:
-                continue
-            
-            cluster = []
-            queue = deque([start])
-            visited.add(start)
-            while queue:
-                point = queue.popleft()
-                cluster.append(point)
-                for neighbour in frontiers_coords:
-                    if neighbour not in visited and math.dist(point, neighbour) < 0.6:
-                                                visited.add(neighbour)
-                                                queue.append(neighbour)
-            clusters.append(cluster)
 
-
-        # for f in frontiers_coords:
-        #     found_cluster = False
-        #     for cluster in clusters:
-        #         if math.dist(f, cluster[0]) < 0.6:
-        #             cluster.append(f)
-        #             found_cluster = True
-        #             break
-
-        #     if not found_cluster:
-        #         clusters.append([f])
-            
-
+        clusters = self.cluster_frontiers(frontiers_coords)
 
         scored_goals = []
         for cluster in clusters:
@@ -139,10 +152,10 @@ class SimpleExplorer(Node):
             dist = math.dist(centre, self.pos)
             size = len(cluster)
 
-            if size < 5:continue
+            if size <2:continue
             if dist < 0.1: continue
             if any(math.dist(centre, b) < BLACKLIST_RADIUS for b in self.blacklist): continue
-            utility = (size**1.2) / (dist + 0.5)
+            utility = (size**1.5) / (dist + 0.1)
 
             scored_goals.append((utility, centre))
         
@@ -164,19 +177,11 @@ class SimpleExplorer(Node):
         self.current_goal = best_goal
         self.current_score = best_score
         
-        #Math for launcher not hitting the wall
-        dx = self.pos[0] - best_goal[0]
-        dy = self.pos[1] - best_goal[1]
-        d = math.sqrt(dx**2 + dy**2)
-
-
-        final_x = best_goal[0] + (dx / (d+0.0000001)) * LAUNCHER_OFFSET_Y
-        final_y = best_goal[1] + (dy / (d+0.0000001)) * LAUNCHER_OFFSET_Y
 
         msg = PoseStamped()
         msg.header.frame_id = 'map'
-        msg.pose.position.x =  final_x
-        msg.pose.position.y = final_y
+        msg.pose.position.x =  best_goal[0]
+        msg.pose.position.y = best_goal[1]
         msg.pose.orientation.w = 1.0
         msg.header.stamp = self.get_clock().now().to_msg()
         self.goal_pub.publish(msg)
