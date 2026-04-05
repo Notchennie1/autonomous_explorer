@@ -88,6 +88,9 @@ class SimpleExplorer(Node):
             return
 
         if self.current_goal is not None:
+            dist_to_goal = math.dist(self.pos, self.current_goal)
+            if dist_to_goal > 0.5:
+                return
             moved = math.dist(self.pos, self.last_pos)
             if moved < 0.01:
                 self.stuck_counter += 1
@@ -153,7 +156,7 @@ class SimpleExplorer(Node):
             size = len(cluster)
 
             if size <2:continue
-            if dist < 0.1: continue
+            if dist < 0.1 or dist > 3.0: continue
             if any(math.dist(centre, b) < BLACKLIST_RADIUS for b in self.blacklist): continue
             utility = (size**1.5) / (dist + 0.1)
 
