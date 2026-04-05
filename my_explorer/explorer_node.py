@@ -5,6 +5,8 @@ from geometry_msgs.msg import PoseStamped
 import math
 from collections import deque
 from geometry_msgs.msg import Twist
+from rclpy.action import ActionClient                  
+from nav2_msgs.action import NavigateToPose
 
 #To commit to goals for longer
 SWITCH_THRESHOLD  = 3.0
@@ -17,8 +19,9 @@ class SimpleExplorer(Node):
 
         self.map_sub = self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
         self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
-        self.goal_pub = self.create_publisher(PoseStamped, '/goal_pose', 10)
-        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+
+
 
         self.map_msg = None
         self.pos = (0.0, 0.0)
@@ -29,7 +32,8 @@ class SimpleExplorer(Node):
         #Prevent oscillation aaround same goal
         self.stuck_counter = 0
         self.blacklist     = []
-    
+        self.goal_in_progress = False
+
     def map_callback(self,msg):
         self.map_msg = msg
         self.res = self.map_msg.info.resolution
@@ -84,13 +88,10 @@ class SimpleExplorer(Node):
 
 
     def explore(self):
-        if not self.map_msg: 
+        if not self.map_msg or self.goal_in_progress: 
             return
 
         if self.current_goal is not None:
-            dist_to_goal = math.dist(self.pos, self.current_goal)
-            if dist_to_goal > 0.5:
-                return
             moved = math.dist(self.pos, self.last_pos)
             if moved < 0.01:
                 self.stuck_counter += 1
@@ -98,7 +99,7 @@ class SimpleExplorer(Node):
                 self.stuck_counter = 0
         self.last_pos = self.pos
 
-        if self.stuck_counter >= 5:
+        if self.stuck_counter >= 10:
             self.get_logger().error("STUCK")
             if self.current_goal:
                 self.blacklist.append(self.current_goal)
@@ -108,6 +109,7 @@ class SimpleExplorer(Node):
             self.current_goal  = None
             self.current_score = 0.0
             self.stuck_counter = 0
+            self.goal_in_progress = False
             self.last_pos = self.pos
 
             #Reset everything
@@ -115,7 +117,6 @@ class SimpleExplorer(Node):
             stop_msg.header.frame_id = 'map'
             stop_msg.pose.position.x, stop_msg.pose.position.y = self.pos
             stop_msg.pose.orientation.w = 1.0
-            self.goal_pub.publish(stop_msg)
             return
 
         
@@ -156,7 +157,7 @@ class SimpleExplorer(Node):
             size = len(cluster)
 
             if size <2:continue
-            if dist < 0.1 or dist > 3.0: continue
+            if dist < 0.1:continue
             if any(math.dist(centre, b) < BLACKLIST_RADIUS for b in self.blacklist): continue
             utility = (size**1.5) / (dist + 0.1)
 
@@ -179,16 +180,47 @@ class SimpleExplorer(Node):
         
         self.current_goal = best_goal
         self.current_score = best_score
+        self.send_navigation_goal(best_goal)
         
 
-        msg = PoseStamped()
-        msg.header.frame_id = 'map'
-        msg.pose.position.x =  best_goal[0]
-        msg.pose.position.y = best_goal[1]
-        msg.pose.orientation.w = 1.0
-        msg.header.stamp = self.get_clock().now().to_msg()
-        self.goal_pub.publish(msg)
-        self.get_logger().info(f"Moving to: {best_goal}")
+        # msg = PoseStamped()
+        # msg.header.frame_id = 'map'
+        # msg.pose.position.x =  best_goal[0]
+        # msg.pose.position.y = best_goal[1]
+        # msg.pose.orientation.w = 1.0
+        # msg.header.stamp = self.get_clock().now().to_msg()
+        # self.goal_pub.publish(msg)
+        # self.get_logger().info(f"Moving to: {best_goal}")
+    def send_navigation_goal(self, coords):                   
+        if not self.nav_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error("NavigateToPose action server not available!")
+            return
+
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = coords[0]
+        goal_msg.pose.pose.position.y = coords[1]
+        goal_msg.pose.pose.orientation.w = 1.0
+
+        self.get_logger().info(f"Sending goal: {coords}")
+        self.goal_in_progress = True                         
+        send_goal_future = self.nav_client.send_goal_async(goal_msg)
+        send_goal_future.add_done_callback(self.goal_response_callback)
+
+    def goal_response_callback(self, future):                 
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().error("Goal rejected by Nav2!")
+            self.goal_in_progress = False
+            return
+        self.get_result_future = goal_handle.get_result_async()
+        self.get_result_future.add_done_callback(self.get_result_callback)
+
+    def get_result_callback(self, future):                    
+        self.current_goal = None
+        self.goal_in_progress = False
+        self.get_logger().info("Goal reached, finding next frontier.")
 
 def main():
     rclpy.init()
