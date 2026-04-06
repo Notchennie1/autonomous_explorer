@@ -7,6 +7,7 @@ from collections import deque
 from geometry_msgs.msg import Twist
 from rclpy.action import ActionClient                  
 from nav2_msgs.action import NavigateToPose
+from std_msgs.msg import Bool
 
 #To commit to goals for longer
 SWITCH_THRESHOLD  = 3.0
@@ -17,22 +18,27 @@ class SimpleExplorer(Node):
     def __init__(self):
         super().__init__('simple_explorer')
 
+        self.active_sub = self.create_subscription(Bool, '/explorer_active', self.active_callback, 10)
         self.map_sub = self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
         self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
-
-
+        self.is_active = True
         self.map_msg = None
         self.pos = (0.0, 0.0)
         self.last_pos = (0.0,0.0)
         self.timer = self.create_timer(3.0, self.explore)
         self.current_goal = None
         self.current_score = 0.0
+
         #Prevent oscillation aaround same goal
         self.stuck_counter = 0
         self.blacklist     = []
         self.goal_in_progress = False
+
+    def active_callback(self, msg):
+        self.is_active = msg.data
+        if not self.is_active: self.nav_client.cancel_all_goals()
 
     def map_callback(self,msg):
         self.map_msg = msg
@@ -88,6 +94,7 @@ class SimpleExplorer(Node):
 
 
     def explore(self):
+        if not self.is_active: return
         if not self.map_msg or self.goal_in_progress: 
             return
 
@@ -159,7 +166,7 @@ class SimpleExplorer(Node):
             if size <2:continue
             if dist < 0.1:continue
             if any(math.dist(centre, b) < BLACKLIST_RADIUS for b in self.blacklist): continue
-            utility = (size**1.5) / (dist + 0.1)
+            utility = (size) / (dist + 0.1)
 
             scored_goals.append((utility, centre))
         
